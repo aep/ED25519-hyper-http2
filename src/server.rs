@@ -11,10 +11,28 @@ extern crate tokio_openssl;
 use futures::{future, Future, Stream};
 use hyper::service::service_fn;
 use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode};
+use std::net::{
+    SocketAddr,
+    IpAddr,
+    Ipv4Addr,
+};
+use std::sync::Arc;
+use tokio::io;
+use tokio::net::TcpListener;
+use tokio::io::AsyncRead;
+use std::env;
+use tokio_openssl::{SslAcceptorExt};
+use openssl::ssl::{SslAcceptor, SslMethod};
+use std::fs::File;
+use openssl::{
+    x509::X509,
+    pkey::PKey,
+};
+use hyper::server::conn::Http;
 
+// just the http handler. boring, skip this
 static TEXT: &str = "Hello, World!";
 static NOTFOUND: &[u8] = b"Not Found";
-
 fn serve(req: Request<Body>) -> Box<Future<Item=Response<Body>, Error=hyper::Error> + Send> {
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/") => {
@@ -31,26 +49,6 @@ fn serve(req: Request<Body>) -> Box<Future<Item=Response<Body>, Error=hyper::Err
     }
 }
 
-use std::net::{
-    SocketAddr,
-    IpAddr,
-    Ipv4Addr,
-};
-
-use std::sync::Arc;
-use tokio::io;
-use tokio::net::TcpListener;
-use tokio::io::AsyncRead;
-use std::env;
-use tokio_openssl::{SslAcceptorExt};
-use openssl::ssl::{SslAcceptor, SslMethod};
-use std::fs::File;
-use openssl::{
-    x509::X509,
-    pkey::PKey,
-};
-use hyper::server::conn::Http;
-
 
 fn main() {
     if let Err(_) = env::var("RUST_LOG") {
@@ -58,6 +56,7 @@ fn main() {
     }
     env_logger::init();
 
+    // this is the private key, which could be loaded from whatever static storage
     let key: [u8; 32] = [
         0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60,
         0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c, 0xc4,
@@ -65,6 +64,7 @@ fn main() {
         0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae, 0x7f, 0x60 ];
     let (cert, pkey) = mk_x509(&key).unwrap();
 
+    // slap the keys into an acceptor
     let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls()).unwrap();
     acceptor.set_private_key(&pkey).unwrap();
     acceptor.set_certificate(&cert).unwrap();
@@ -74,13 +74,17 @@ fn main() {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3000);
     info!("listening on {}", addr);
     let tcp = TcpListener::bind(&addr).unwrap();
+
+    // for each incomming connection
     let server = tcp.incoming().for_each(move |tcp| {
         let acceptor = acceptor.clone();
+        // build up TLS
         let acceptor = acceptor.accept_async(tcp).and_then(|conn|{
             let svc = service_fn(|req|{
                 serve(req)
             });
             let http = Http::new();
+            // build up http
             let conn = http.serve_connection(conn, svc)
                 .map_err(|err| {
                     println!("srv io error {:?}", err)
@@ -101,15 +105,7 @@ fn main() {
     tokio::run(server);
 }
 
-fn cvt_p<T>(r: *mut T) -> Result<*mut T, openssl::error::ErrorStack> {
-    use openssl::error::ErrorStack;
-    if r.is_null() {
-        Err(ErrorStack::get())
-    } else {
-        Ok(r)
-    }
-}
-
+// generate an x509 on the fly given private key material
 fn mk_x509(key: &[u8]) -> Result<(openssl::x509::X509, openssl::pkey::PKey<openssl::pkey::Private>), openssl::error::ErrorStack> {
     use openssl::{
         asn1::Asn1Time,
@@ -125,13 +121,13 @@ fn mk_x509(key: &[u8]) -> Result<(openssl::x509::X509, openssl::pkey::PKey<opens
     };
 
     // header copied from 'openssl genpkey -algorithm ed25519'
+    // there's actually no working API to generate an ed25519 into PKey from existing material directly
     let mut der = vec![0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20];
 
     der.extend_from_slice(&key);
-
     let privkey = PKey::private_key_from_der(&der)?;
 
-
+    // this is the "Subject" as well as "Issuer" since we self sign
     let mut x509_name = X509NameBuilder::new()?;
     x509_name.append_entry_by_text("C", "US")?;
     x509_name.append_entry_by_text("ST", "TX")?;
@@ -141,6 +137,8 @@ fn mk_x509(key: &[u8]) -> Result<(openssl::x509::X509, openssl::pkey::PKey<opens
 
     let mut cert_builder = X509::builder()?;
     cert_builder.set_version(2)?;
+
+    // make up a serial number
     let serial_number = {
         let mut serial = BigNum::new()?;
         serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
@@ -156,16 +154,12 @@ fn mk_x509(key: &[u8]) -> Result<(openssl::x509::X509, openssl::pkey::PKey<opens
     cert_builder.set_not_after(&not_after)?;
 
     cert_builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
-//    cert_builder.append_extension(KeyUsage::new()
-//                                  .critical()
-//                                  .key_cert_sign()
-//                                  .crl_sign()
-//                                  .build()?)?;
-//
+    // this is probably junk?
     let subject_key_identifier =
         SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
     cert_builder.append_extension(subject_key_identifier)?;
 
+    // self sign with the ed25519
     cert_builder.sign(&privkey, unsafe{MessageDigest::from_ptr(std::ptr::null_mut())})?;
     let cert = cert_builder.build();
 
