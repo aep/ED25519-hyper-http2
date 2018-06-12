@@ -1,0 +1,29 @@
+[package]
+name = "xix"
+version = "0.1.0"
+authors = ["Arvid E. Picciani <aep@exys.org>"]
+
+[dependencies]
+hyper = "0.12"
+futures = "0.1.21"
+log = "0.4"
+env_logger = "0.5.10"
+tokio = "0.1.7"
+openssl = "0.10.10"
+tokio-openssl = "0.2"
+openssl-sys = {path = "/home/aep/proj/rust-openssl/openssl-sys"}
+
+
+[[bin]]
+name = "client"
+path = "src/client.rs"
+
+[[bin]]
+name = "server"
+path = "src/server.rs"
+
+
+
+[replace]
+"openssl-sys:0.9.33" = { path = "/home/aep/proj/rust-openssl/openssl-sys"}
+"openssl:0.10.10"    = { path = "/home/aep/proj/rust-openssl/openssl"}
