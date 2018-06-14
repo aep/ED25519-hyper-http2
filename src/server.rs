@@ -1,16 +1,15 @@
+extern crate env_logger;
 extern crate futures;
 extern crate hyper;
-#[macro_use]
-extern crate log;
-extern crate env_logger;
 extern crate openssl;
 extern crate tokio;
 extern crate tokio_openssl;
+#[macro_use] extern crate log;
 
 use futures::{future, Future, Stream};
+use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
-use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode};
 use openssl::ssl::{SslAcceptor, SslMethod};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -21,8 +20,6 @@ use tokio_openssl::SslAcceptorExt;
 mod identity;
 mod verifier;
 
-// just the http handler. boring, skip this
-static TEXT: &str = "Hello, World!";
 static NOTFOUND: &[u8] = b"Not Found";
 fn serve(req: Request<Body>) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
     match (req.method(), req.uri().path()) {
@@ -80,29 +77,38 @@ fn main() {
     // for each incomming connection
     let server = tcp.incoming()
         .for_each(move |conn| {
-            //  let acceptor = acceptor.clone();
-            //  // build up TLS
-            //  let acceptor = acceptor.accept_async(tcp).and_then(|conn|{
-            //      let pkey = conn.get_ref().ssl().peer_certificate().unwrap().public_key().unwrap();
-            //      let pkey = pkey.public_key_to_der().unwrap();
-            //      let identity = match identity::from_der(&pkey) {
-            //          None => return Ok(()),
-            //          Some(i) => i,
-            //      };
-            //      info!("peer identity: {}", identity);
+            let acceptor = acceptor.clone();
+            // build up TLS
+            let acceptor = acceptor
+                .accept_async(conn)
+                .and_then(|conn| {
+                    let pkey = conn.get_ref()
+                        .ssl()
+                        .peer_certificate()
+                        .unwrap()
+                        .public_key()
+                        .unwrap();
+                    let pkey = pkey.public_key_to_der().unwrap();
+                    let identity = match identity::from_der(&pkey) {
+                        None => return Ok(()),
+                        Some(i) => i,
+                    };
+                    info!("peer identity: {}", identity);
 
-            let svc = service_fn(|req| serve(req));
-            let mut http = Http::new();
-            http.http2_only(true);
-            // build up http
-            let conn = http.serve_connection(conn, svc)
-                .map_err(|err| error!("srv io error {:?}", err));
-            tokio::spawn(conn);
+                    let svc = service_fn(|req| serve(req));
+                    let mut http = Http::new();
+                    http.http2_only(true);
+                    // build up http
+                    let conn = http.serve_connection(conn, svc)
+                        .map_err(|err| error!("srv io error {:?}", err));
+                    tokio::spawn(conn);
+                    Ok(())
+                })
+                .map_err(|err| {
+                    error!("TLS error {:?}", err);
+                });
+            tokio::spawn(acceptor);
             Ok(())
-            //  })
-            //  .map_err(|err|{error!("TLS error {:?}", err);});
-            //  tokio::spawn(acceptor);
-            //  Ok(())
         })
         .map_err(|err| {
             error!("srv error {:?}", err);

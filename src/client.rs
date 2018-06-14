@@ -5,8 +5,8 @@ extern crate openssl;
 extern crate tokio;
 extern crate tokio_openssl;
 extern crate url;
-#[macro_use]
-extern crate log;
+extern crate hyper;
+#[macro_use] extern crate log;
 
 use futures::Future;
 use openssl::ssl::{SslConnector, SslMethod};
@@ -15,6 +15,12 @@ use std::net::ToSocketAddrs;
 use tokio::io::{flush, read_to_end, write_all};
 use tokio::net::TcpStream;
 use tokio_openssl::SslConnectorExt;
+use hyper::client::conn::{
+    Builder,
+    SendRequest,
+    Connection,
+    Handshake,
+};
 
 mod identity;
 mod verifier;
@@ -74,12 +80,13 @@ pub fn main() {
             let pkey = pkey.public_key_to_der().unwrap();
             let identity = identity::from_der(&pkey).unwrap();
             info!("peer identity: {}", identity);
-            write_all(socket, b"GET / HTTP/1.0\r\n\r\n")
+
+            Builder::new()
+                .http2_only(true)
+                .handshake::<_,hyper::Body>(socket)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         })
-        .and_then(|(socket, _)| flush(socket))
-        .and_then(|socket| read_to_end(socket, Vec::new()))
-        .and_then(|st| {
-            println!("{}", String::from_utf8_lossy(&st.1));
+        .and_then(|hs|{
             Ok(())
         })
         .map_err(|e| {

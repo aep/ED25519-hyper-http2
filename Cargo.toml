@@ -30,3 +30,7 @@ path = "src/client.rs"
 name = "server"
 path = "src/server.rs"
 
+
+[replace]
+"h2:0.1.9" = {git = "https://github.com/aep/h2.git"}
+
