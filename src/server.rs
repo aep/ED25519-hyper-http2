@@ -1,60 +1,48 @@
 extern crate futures;
+extern crate hyper;
 #[macro_use]
 extern crate log;
-extern crate bytes;
 extern crate env_logger;
-extern crate h2;
-extern crate http;
 extern crate openssl;
 extern crate tokio;
 extern crate tokio_openssl;
 
-use bytes::{Buf, Bytes, IntoBuf};
 use futures::{future, Future, Stream};
-use h2::server;
-use http::{Response, StatusCode};
+use hyper::server::conn::Http;
+use hyper::service::service_fn;
+use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode};
 use openssl::ssl::{SslAcceptor, SslMethod};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_openssl::SslAcceptorExt;
-use futures::IntoFuture;
 
 mod identity;
 mod verifier;
 
-
-fn handle_request(
-    identity: String,
-    req: http::Request<h2::RecvStream>,
-    mut resp: h2::server::SendResponse<bytes::Bytes>,
-) -> impl Future<Item=(), Error=h2::Error> {
-    info!("[{}] H2 sending response", identity);
-    let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
-
-    let identity_ = identity.clone();
-
-    resp.send_response(response, false)
-        .into_future()
-        .and_then(|mut send| {
-            req.into_body()
-                .fold(send, move |mut send, frame| {
-                    info!("[{}] H2 recv frame {}", identity_, frame.len());
-                    if let Err(e) = send.send_data(frame, false) {
-                        error!(" -> err={:?}", e);
-                    }
-                    future::ok::<_, h2::Error>(send)
-                })
-                .and_then(move |mut send| {
-                    info!("[{}] H2 closing", identity);
-                    // close send stream when recv closed
-                    if let Err(e) = send.send_data(Bytes::new(), true) {
-                        error!(" -> err={:?}", e);
-                    }
-                    Ok(())
-                })
-        })
+// just the http handler. boring, skip this
+static TEXT: &str = "Hello, World!";
+static NOTFOUND: &[u8] = b"Not Found";
+fn serve(req: Request<Body>) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
+    match (req.method(), req.uri().path()) {
+        (&Method::POST, "/") => {
+            let body = req.into_body().map(|i| {
+                info!("got data {}", i.len());
+                i
+            });
+            Box::new(future::ok(Response::new(Body::wrap_stream(body))))
+        }
+        _ => {
+            let body = Body::from(NOTFOUND);
+            Box::new(future::ok(
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(body)
+                    .unwrap(),
+            ))
+        }
+    }
 }
 
 fn main() {
@@ -92,47 +80,29 @@ fn main() {
     // for each incomming connection
     let server = tcp.incoming()
         .for_each(move |conn| {
-//            let acceptor = acceptor.clone();
-//            // build up TLS
-//            let acceptor = acceptor
-//                .accept_async(tcp)
-//                .and_then(|conn| {
-//                    let pkey = conn.get_ref()
-//                        .ssl()
-//                        .peer_certificate()
-//                        .unwrap()
-//                        .public_key()
-//                        .unwrap();
-//                    let pkey = pkey.public_key_to_der().unwrap();
-//                    let identity = match identity::from_der(&pkey) {
-//                        None => return Ok(()),
-//                        Some(i) => i,
-//                    };
-//                    info!("[{}] TLS bound", identity);
-                    let identity = String::from("null");
+            //  let acceptor = acceptor.clone();
+            //  // build up TLS
+            //  let acceptor = acceptor.accept_async(tcp).and_then(|conn|{
+            //      let pkey = conn.get_ref().ssl().peer_certificate().unwrap().public_key().unwrap();
+            //      let pkey = pkey.public_key_to_der().unwrap();
+            //      let identity = match identity::from_der(&pkey) {
+            //          None => return Ok(()),
+            //          Some(i) => i,
+            //      };
+            //      info!("peer identity: {}", identity);
 
-                    let connection = server::handshake(conn)
-                        .and_then(move |conn| {
-                            info!("[{}] H2 connection bound", identity);
-                            conn.for_each(move |(request, mut respond)| {
-                                let identity_ = identity.clone();
-                                tokio::spawn(handle_request(identity.clone(), request, respond)
-                                             .map_err(move |e| error!("[{}] {}", identity_, e)));
-                                future::ok(())
-                            })
-                        })
-                        .map_err(|err| {
-                            error!("h2 error {:?}", err);
-                        });
-
-                    tokio::spawn(connection);
-                    Ok(())
-//                })
-//                .map_err(|err| {
-//                    error!("TLS error {:?}", err);
-//                });
-//            tokio::spawn(acceptor);
-//            Ok(())
+            let svc = service_fn(|req| serve(req));
+            let mut http = Http::new();
+            http.http2_only(true);
+            // build up http
+            let conn = http.serve_connection(conn, svc)
+                .map_err(|err| error!("srv io error {:?}", err));
+            tokio::spawn(conn);
+            Ok(())
+            //  })
+            //  .map_err(|err|{error!("TLS error {:?}", err);});
+            //  tokio::spawn(acceptor);
+            //  Ok(())
         })
         .map_err(|err| {
             error!("srv error {:?}", err);
