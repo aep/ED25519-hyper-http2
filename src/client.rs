@@ -16,11 +16,18 @@ use tokio::io::{flush, read_to_end, write_all};
 use tokio::net::TcpStream;
 use tokio_openssl::SslConnectorExt;
 use hyper::client::conn::{
-    Builder,
+    self,
     SendRequest,
     Connection,
     Handshake,
 };
+
+use hyper::{
+    Request,
+    Body,
+    header,
+};
+
 
 mod identity;
 mod verifier;
@@ -31,15 +38,15 @@ pub fn main() {
     }
     env_logger::init();
 
-    let url = match env::args().nth(1) {
-        Some(url) => url,
+    let uri = match env::args().nth(1) {
+        Some(uri) => uri,
         None => {
             println!("Usage: client <url>");
             return;
         }
     };
 
-    let url = url::Url::parse(&url).unwrap();
+    let url = url::Url::parse(&uri).unwrap();
     let addr = url.to_socket_addrs().unwrap().next().unwrap();
 
     let key: [u8; 32] = [
@@ -81,12 +88,32 @@ pub fn main() {
             let identity = identity::from_der(&pkey).unwrap();
             info!("peer identity: {}", identity);
 
-            Builder::new()
+            conn::Builder::new()
                 .http2_only(true)
                 .handshake::<_,hyper::Body>(socket)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
         })
         .and_then(|hs|{
+            let (send, con) = hs;
+            tokio::spawn(con.map_err(|e| error!("{}",e)));
+            Ok(send)
+        })
+        .and_then(|mut send|{
+            info!("sending req");
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(header::HOST, "hyper.rs")
+                .body(Body::from("{}"))
+                .unwrap();
+            send.send_request(req)
+                .map_err(|e|{
+                    error!(">>{}", e);
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })
+        })
+        .and_then(|hs|{
+            info!("got something");
             Ok(())
         })
         .map_err(|e| {
