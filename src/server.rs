@@ -30,31 +30,30 @@ fn handle_request(
     req: http::Request<h2::RecvStream>,
     mut resp: h2::server::SendResponse<bytes::Bytes>,
 ) -> impl Future<Item=(), Error=h2::Error> {
-    info!("H2 sending response");
+    info!("[{}] H2 sending response", identity);
     let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
+
+    let identity_ = identity.clone();
 
     resp.send_response(response, false)
         .into_future()
         .and_then(|mut send| {
-            let fwd = req.into_body()
-                .fold(send, |mut send, frame| {
-                    info!("H2 recv frame {}", frame.len());
+            req.into_body()
+                .fold(send, move |mut send, frame| {
+                    info!("[{}] H2 recv frame {}", identity_, frame.len());
                     if let Err(e) = send.send_data(frame, false) {
                         error!(" -> err={:?}", e);
                     }
                     future::ok::<_, h2::Error>(send)
                 })
-                .and_then(|mut send| {
-                    info!("H2 closing");
+                .and_then(move |mut send| {
+                    info!("[{}] H2 closing", identity);
                     // close send stream when recv closed
                     if let Err(e) = send.send_data(Bytes::new(), true) {
                         error!(" -> err={:?}", e);
                     }
                     Ok(())
                 })
-                .map_err(|_|());
-                tokio::spawn(fwd);
-            Ok(())
         })
 }
 
@@ -116,7 +115,10 @@ fn main() {
                         .and_then(move |conn| {
                             info!("[{}] H2 connection bound", identity);
                             conn.for_each(move |(request, mut respond)| {
-                                handle_request(identity.clone(), request, respond)
+                                let identity_ = identity.clone();
+                                tokio::spawn(handle_request(identity.clone(), request, respond)
+                                             .map_err(move |e| error!("[{}] {}", identity_, e)));
+                                future::ok(())
                             })
                         })
                         .map_err(|err| {
