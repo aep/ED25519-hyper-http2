@@ -4,21 +4,16 @@ extern crate hyper;
 extern crate openssl;
 extern crate tokio;
 extern crate tokio_openssl;
-#[macro_use] extern crate log;
+#[macro_use]
+extern crate log;
+extern crate x0;
 
 use futures::{future, Future, Stream};
-use hyper::{Body, Chunk, Client, Method, Request, Response, Server, StatusCode};
 use hyper::server::conn::Http;
 use hyper::service::service_fn;
-use openssl::ssl::{SslAcceptor, SslMethod};
+use hyper::{Body, Chunk, Method, Request, Response, StatusCode};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
-use tokio::net::TcpListener;
-use tokio_openssl::SslAcceptorExt;
-
-mod identity;
-mod verifier;
 
 static NOTFOUND: &[u8] = b"Not Found";
 fn serve(req: Request<Body>) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
@@ -55,64 +50,38 @@ fn main() {
         0x7f, 0x60,
     ];
 
-    info!("this identity: {}", identity::from_secret(&key));
-    let (cert, pkey) = identity::mk_x509(&key).unwrap();
-
-    // slap the keys into an acceptor
-    let mut acceptor = SslAcceptor::mozilla_modern(SslMethod::tls()).unwrap();
-    acceptor.set_private_key(&pkey).unwrap();
-    acceptor.set_certificate(&cert).unwrap();
-    acceptor.check_private_key().unwrap();
-    let verifier = verifier::Verifier::new_trust_all();
-    acceptor.set_verify_callback(
-        openssl::ssl::SslVerifyMode::PEER | openssl::ssl::SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-        move |ok, store| verifier.verify(ok, store),
-    );
-    let acceptor = Arc::new(acceptor.build());
+    let identity = x0::Identity::from_private(key.to_vec());
+    info!("this identity: {}", identity.public_id());
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 3000);
+
+    let verifier = x0::Verifier::new_trust_all();
+
+    let server = x0::server::builder()
+        .identity(identity)
+        .verifier(verifier)
+        .bind(addr)
+        .unwrap();
+
     info!("listening on {}", addr);
-    let tcp = TcpListener::bind(&addr).unwrap();
 
-    // for each incomming connection
-    let server = tcp.incoming()
-        .for_each(move |conn| {
-            let acceptor = acceptor.clone();
-            // build up TLS
-            let acceptor = acceptor
-                .accept_async(conn)
-                .and_then(|conn| {
-                    let pkey = conn.get_ref()
-                        .ssl()
-                        .peer_certificate()
-                        .unwrap()
-                        .public_key()
-                        .unwrap();
-                    let pkey = pkey.public_key_to_der().unwrap();
-                    let identity = match identity::from_der(&pkey) {
-                        None => return Ok(()),
-                        Some(i) => i,
-                    };
-                    info!("peer identity: {}", identity);
-
-                    let svc = service_fn(|req| serve(req));
-                    let mut http = Http::new();
-                    http.http2_only(true);
-                    // build up http
-                    let conn = http.serve_connection(conn, svc)
-                        .map_err(|err| error!("srv io error {:?}", err));
-                    tokio::spawn(conn);
-                    Ok(())
-                })
-                .map_err(|err| {
-                    error!("TLS error {:?}", err);
-                });
-            tokio::spawn(acceptor);
+    let server = server
+        .for_each(|maybe|{
+            let (identity, conn) = match maybe {
+                Err(e) => {warn!("{}", e); return Ok(())},
+                Ok(v)  => v,
+            };
+            info!("[{}] connected", identity.public_id());
+            let svc = service_fn(|req| serve(req));
+            let mut http = Http::new();
+            http.http2_only(true);
+            let conn = http.serve_connection(conn, svc)
+                .map_err(|err| error!("srv io error {:?}", err));
+            tokio::spawn(conn);
             Ok(())
         })
-        .map_err(|err| {
-            error!("srv error {:?}", err);
-        });
+        .map_err(|e| {error!("srv error {}", e);});
+
 
     tokio::run(server);
 }

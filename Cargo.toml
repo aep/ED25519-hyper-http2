@@ -14,13 +14,8 @@ openssl = "0.10.10"
 tokio-openssl = "0.2"
 http = "0.1"
 url = "1.7"
-der-parser = "0.5"
-nom =  "3.1"
-bs58 = "0.2"
-ed25519-dalek = "^0.6"
-sha2 = "0.7"
-crc8 = "0.1"
 bytes = "*"
+x0 = {path = "x0"}
 
 [[bin]]
 name = "client"
