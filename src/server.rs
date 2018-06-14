@@ -19,41 +19,43 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_openssl::SslAcceptorExt;
+use futures::IntoFuture;
 
 mod identity;
 mod verifier;
+
 
 fn handle_request(
     identity: String,
     req: http::Request<h2::RecvStream>,
     mut resp: h2::server::SendResponse<bytes::Bytes>,
-) -> Box<Future<Item = (), Error = h2::Error> + Send> {
+) -> impl Future<Item=(), Error=h2::Error> {
+    info!("H2 sending response");
     let response = Response::builder().status(StatusCode::OK).body(()).unwrap();
 
-    let mut send = match resp.send_response(response, false) {
-        Ok(send) => send,
-        Err(e) => {
-            error!("error respond; err={:?}", e);
-            return Box::new(future::err(e));
-        }
-    };
-
-    let sti = req.into_body()
-        .for_each(move |frame| {
-            info!("H2 recv frame {:?}", frame);
-            if let Err(e) = send.send_data(frame, false) {
-                error!(" -> err={:?}", e);
-            }
+    resp.send_response(response, false)
+        .into_future()
+        .and_then(|mut send| {
+            let fwd = req.into_body()
+                .fold(send, |mut send, frame| {
+                    info!("H2 recv frame {}", frame.len());
+                    if let Err(e) = send.send_data(frame, false) {
+                        error!(" -> err={:?}", e);
+                    }
+                    future::ok::<_, h2::Error>(send)
+                })
+                .and_then(|mut send| {
+                    info!("H2 closing");
+                    // close send stream when recv closed
+                    if let Err(e) = send.send_data(Bytes::new(), true) {
+                        error!(" -> err={:?}", e);
+                    }
+                    Ok(())
+                })
+                .map_err(|_|());
+                tokio::spawn(fwd);
             Ok(())
         })
-        .and_then(|_| {
-            // close send stream when recv closed
-            if let Err(e) = send.send_data(Bytes::new(), true) {
-                error!(" -> err={:?}", e);
-            }
-            Ok(())
-        });
-    Box::new(sti)
 }
 
 fn main() {
@@ -90,24 +92,25 @@ fn main() {
 
     // for each incomming connection
     let server = tcp.incoming()
-        .for_each(move |tcp| {
-            let acceptor = acceptor.clone();
-            // build up TLS
-            let acceptor = acceptor
-                .accept_async(tcp)
-                .and_then(|conn| {
-                    let pkey = conn.get_ref()
-                        .ssl()
-                        .peer_certificate()
-                        .unwrap()
-                        .public_key()
-                        .unwrap();
-                    let pkey = pkey.public_key_to_der().unwrap();
-                    let identity = match identity::from_der(&pkey) {
-                        None => return Ok(()),
-                        Some(i) => i,
-                    };
-                    info!("[{}] TLS bound", identity);
+        .for_each(move |conn| {
+//            let acceptor = acceptor.clone();
+//            // build up TLS
+//            let acceptor = acceptor
+//                .accept_async(tcp)
+//                .and_then(|conn| {
+//                    let pkey = conn.get_ref()
+//                        .ssl()
+//                        .peer_certificate()
+//                        .unwrap()
+//                        .public_key()
+//                        .unwrap();
+//                    let pkey = pkey.public_key_to_der().unwrap();
+//                    let identity = match identity::from_der(&pkey) {
+//                        None => return Ok(()),
+//                        Some(i) => i,
+//                    };
+//                    info!("[{}] TLS bound", identity);
+                    let identity = String::from("null");
 
                     let connection = server::handshake(conn)
                         .and_then(move |conn| {
@@ -122,12 +125,12 @@ fn main() {
 
                     tokio::spawn(connection);
                     Ok(())
-                })
-                .map_err(|err| {
-                    error!("TLS error {:?}", err);
-                });
-            tokio::spawn(acceptor);
-            Ok(())
+//                })
+//                .map_err(|err| {
+//                    error!("TLS error {:?}", err);
+//                });
+//            tokio::spawn(acceptor);
+//            Ok(())
         })
         .map_err(|err| {
             error!("srv error {:?}", err);
