@@ -6,12 +6,25 @@ extern crate url;
 #[macro_use]
 extern crate log;
 extern crate x0;
+extern crate prost;
+#[macro_use] extern crate prost_derive;
+extern crate tower_h2;
+extern crate tower_grpc;
+extern crate tower_http;
 
 use futures::Future;
 use futures::Stream;
-use hyper::{Body, Request};
 use std::env;
 use std::io::Write;
+use tower_h2::client::Connection;
+use tokio::{runtime};
+use tower_grpc::{Request, Response};
+
+pub mod zeroxproto {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/zeroxproto.v1.rs"));
+    }
+}
 
 pub fn main() {
     if let Err(_) = env::var("RUST_LOG") {
@@ -36,8 +49,11 @@ pub fn main() {
     info!("this identity: {}", identity.public_id());
 
     let verifier = x0::Verifier::new(vec![String::from(
-        "oXBUPpxoaRixVSgEdtPxhUNRfUY5KDztGqjEmEmc6Pp3vX1",
-    )]);
+            "oXBUPpxoaRixVSgEdtPxhUNRfUY5KDztGqjEmEmc6Pp3vX1",
+            )]);
+
+    let mut rt = runtime::Runtime::new().unwrap();
+    let executor = rt.executor();
 
     let client = x0::client::builder()
         .verifier(verifier)
@@ -46,31 +62,31 @@ pub fn main() {
         .build();
 
     let hello = client
-        .and_then(|(identity, client)| {
+        .and_then(|(identity, conn)| {
             info!("peer identity: {}", identity.public_id());
-
-            let request = Request::builder()
-                .method("POST")
-                .uri(uri)
-                .body(Body::from("look at my data, my data is amazing"))
-                .unwrap();
-
-            client
-                .request(request)
-                .and_then(|res| {
-                    println!("Response: {}", res.status());
-                    println!("Headers: {:#?}", res.headers());
-                    res.into_body().for_each(|chunk| {
-                        std::io::stdout()
-                            .write_all(&chunk)
-                            .map_err(|e| panic!("example expects stdout is open, error={}", e))
-                    })
-                })
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            Connection::handshake(conn, executor)
+                .map_err(|_| panic!("failed HTTP/2.0 handshake"))
         })
-        .map_err(|err| {
-            error!("Error {}", err);
-        });
+    .map(move |conn| {
+        use zeroxproto::v1::client::Bearer;
+        use tower_http::add_origin;
 
-    tokio::run(hello);
+        let conn = add_origin::Builder::new()
+            .uri(uri)
+            .build(conn)
+            .unwrap();
+
+        Bearer::new(conn)
+    })
+    .and_then(|mut client| {
+        use zeroxproto::v1::Empty;
+        client.get_identity(Request::new(Empty{}))
+            .map_err(|e| panic!("gRPC request failed; err={:?}", e))
+    })
+    .and_then(|response| {
+        println!("RESPONSE = {:?}", response);
+        Ok(())
+    });
+
+    rt.block_on(hello).unwrap();
 }

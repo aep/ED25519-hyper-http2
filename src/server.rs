@@ -4,44 +4,66 @@ extern crate hyper;
 extern crate openssl;
 extern crate tokio;
 extern crate tokio_openssl;
-#[macro_use]
-extern crate log;
+#[macro_use] extern crate log;
+extern crate prost;
+#[macro_use] extern crate prost_derive;
 extern crate x0;
+extern crate tower_h2;
+extern crate tower_grpc;
+extern crate http;
 
 use futures::{future, Future, Stream};
-use hyper::server::conn::Http;
-use hyper::service::service_fn;
-use hyper::{Body, Chunk, Method, Request, Response, StatusCode};
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use tower_grpc::{Request, Response};
+use tokio::{runtime};
 
-static NOTFOUND: &[u8] = b"Not Found";
-fn serve(req: Request<Body>) -> Box<Future<Item = Response<Body>, Error = hyper::Error> + Send> {
-    match (req.method(), req.uri().path()) {
-        (&Method::POST, "/") => {
-            let body = req.into_body().map(|i| {
-                info!("got data {}", i.len());
-                i
-            });
-            Box::new(future::ok(Response::new(Body::wrap_stream(body))))
-        }
-        _ => {
-            let body = Body::from(NOTFOUND);
-            Box::new(future::ok(
-                Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(body)
-                    .unwrap(),
-            ))
+
+pub mod zeroxproto {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/zeroxproto.v1.rs"));
+    }
+}
+
+
+#[derive(Clone)]
+struct Bearer {
+}
+
+impl Bearer {
+    pub fn new() -> Self {
+        Self {
         }
     }
 }
+
+impl zeroxproto::v1::server::Bearer for Bearer {
+    type GetIdentityFuture  = future::FutureResult<Response<zeroxproto::v1::IdentityReply>, tower_grpc::Error>;
+
+    fn get_identity(&mut self, request: Request<zeroxproto::v1::Empty>) -> Self::GetIdentityFuture {
+
+        let identity = String::from_utf8(
+            request.headers().get("Y-0X-VERIFIED-IDENTITY").unwrap().as_bytes().to_vec()
+            ).unwrap();
+
+        let response = Response::new(zeroxproto::v1::IdentityReply {
+            version:  1,
+            id: identity,
+        });
+        future::ok(response)
+    }
+}
+
 
 fn main() {
     if let Err(_) = env::var("RUST_LOG") {
         env::set_var("RUST_LOG", "server=debug");
     }
     env_logger::init();
+
+    let rt = runtime::Runtime::new().unwrap();
+    let executor = rt.executor();
+
 
     // this is the private key, which could be loaded from whatever static storage
     let key: [u8; 32] = [
@@ -65,22 +87,33 @@ fn main() {
 
     info!("listening on {}", addr);
 
+    let new_service = zeroxproto::v1::server::BearerServer::new(Bearer::new());
+
+    let h2 = tower_h2::Server::new(new_service, Default::default(), executor);
+
     let server = server
-        .for_each(|maybe|{
+        .for_each(move |maybe|{
             let (identity, conn) = match maybe {
                 Err(e) => {warn!("{}", e); return Ok(())},
                 Ok(v)  => v,
             };
-            info!("[{}] connected", identity.public_id());
-            let svc = service_fn(|req| serve(req));
-            let mut http = Http::new();
-            http.http2_only(true);
-            let conn = http.serve_connection(conn, svc)
-                .map_err(|err| error!("srv io error {:?}", err));
+            let identity = identity.public_id();
+
+            info!("[{}] connected", identity);
+
+            let identity_ = identity.clone();
+            let set_identity = move |request: &mut http::Request<()>| {
+                request.headers_mut().insert("Y-0X-VERIFIED-IDENTITY",
+                    hyper::header::HeaderValue::from_str(&identity_).unwrap());
+            };
+
+            let identity_ = identity.clone();
+            let conn = h2.serve_modified(conn, set_identity)
+                .map_err(move |e| error!("[{}] h2 error: {:?}", identity_, e));
             tokio::spawn(conn);
             Ok(())
         })
-        .map_err(|e| {error!("srv error {}", e);});
+        .map_err(|e| error!("srv error {}", e));
 
 
     tokio::run(server);
